@@ -1,0 +1,28 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Users — any auth user can read, only own profile to write
+    match /users/{userId} {
+      allow read:   if request.auth != null;
+      allow create: if request.auth != null && request.auth.uid == userId;
+      allow update: if request.auth != null && request.auth.uid == userId;
+    }
+
+    // Progress — any auth user can read all (admin needs this for dashboard)
+    match /progress/{docId} {
+      allow read:   if request.auth != null;
+      allow create: if request.auth != null && request.resource.data.userId == request.auth.uid;
+    }
+
+    // Content
+    match /content/{docId} {
+      allow read, write: if request.auth != null;
+    }
+
+    // Question bank
+    match /question_bank/{docId} {
+      allow read, write: if request.auth != null;
+    }
+  }
+}
