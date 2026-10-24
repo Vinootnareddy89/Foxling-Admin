@@ -23,7 +23,7 @@ export const onAuth          = (cb) => onAuthStateChanged(auth, cb);
 // ── CONTENT CRUD ──────────────────────────────────────────
 export const getContent = async () => {
   const s = await getDocs(collection(db, "content"));
-  return s.docs.map(d => ({ id: d.id, ...d.data() }));
+  return s.docs.map(d => ({ ...d.data(), id: d.id }));
 };
 
 export const getContentById = async (id) => {
@@ -60,7 +60,9 @@ export const subscribeContent = (callback) => {
   return onSnapshot(
     collection(db, "content"),
     (snap) => {
-      const data = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+      // Always use Firestore document ID (d.id) as the item id
+      // This ensures delete/update always targets the right document
+      const data = snap.docs.map(d => ({ ...d.data(), id: d.id }));
       callback(data);
     },
     (err) => console.warn("Content listener error:", err)
@@ -127,7 +129,15 @@ export const getAllBankQuestions = async () => {
 };
 
 export const getRandomQuestions = async ({ count=10, subject, grade, type } = {}) => {
-  const allQ = await getAllBankQuestions();
+  // Try sub-banks first (new system), fall back to legacy flat bank
+  let allQ = [];
+  try {
+    allQ = await getAllSubBankQuestions();
+  } catch(e) {}
+  if (allQ.length === 0) {
+    allQ = await getAllBankQuestions();
+  }
+
   let filtered = allQ.filter(q => {
     if (subject && q.subject !== subject) return false;
     if (grade   && Number(q.grade) !== Number(grade)) return false;
@@ -139,4 +149,75 @@ export const getRandomQuestions = async ({ count=10, subject, grade, type } = {}
     ...q,
     id: `qb_${Date.now()}_${i}`,
   }));
+};
+
+// ── SUB-BANKS ─────────────────────────────────────────────
+// Each CSV upload is stored as a named sub-bank
+// Collection: question_banks/{bankId}/meta + chunks
+
+export const saveSubBank = async (bankId, bankName, questions) => {
+  const CHUNK = 400;
+  const chunks = [];
+  for (let i = 0; i < questions.length; i += CHUNK)
+    chunks.push(questions.slice(i, i + CHUNK));
+
+  // Write chunks
+  await Promise.all(chunks.map((ch, i) =>
+    setDoc(doc(db, "question_banks", bankId, "chunks", `chunk_${i}`), {
+      questions: ch, chunkIndex: i, updatedAt: serverTimestamp(),
+    })
+  ));
+
+  // Write sub-bank meta
+  await setDoc(doc(db, "question_banks", bankId), {
+    id: bankId, name: bankName,
+    totalQuestions: questions.length,
+    totalChunks: chunks.length,
+    updatedAt: serverTimestamp(),
+    grade:   questions[0]?.grade   || null,
+    subject: questions[0]?.subject || null,
+    type:    questions[0]?.type    || null,
+  });
+};
+
+export const deleteSubBank = async (bankId) => {
+  // Delete all chunks then the bank doc
+  const meta = await getDoc(doc(db, "question_banks", bankId));
+  if (meta.exists()) {
+    const { totalChunks=0 } = meta.data();
+    await Promise.all(
+      Array.from({length:totalChunks},(_,i)=>
+        deleteDoc(doc(db,"question_banks",bankId,"chunks",`chunk_${i}`))
+      )
+    );
+  }
+  await deleteDoc(doc(db, "question_banks", bankId));
+};
+
+export const listSubBanks = async () => {
+  const snap = await getDocs(collection(db, "question_banks"));
+  return snap.docs.map(d => ({ id:d.id, ...d.data() }))
+    .sort((a,b) => (b.updatedAt?.seconds||0) - (a.updatedAt?.seconds||0));
+};
+
+export const getSubBankQuestions = async (bankId) => {
+  const meta = await getDoc(doc(db, "question_banks", bankId));
+  if (!meta.exists()) return [];
+  const { totalChunks=0 } = meta.data();
+  const all = [];
+  for (let i = 0; i < totalChunks; i++) {
+    const snap = await getDoc(doc(db,"question_banks",bankId,"chunks",`chunk_${i}`));
+    if (snap.exists()) all.push(...(snap.data().questions||[]));
+  }
+  return all;
+};
+
+export const getAllSubBankQuestions = async () => {
+  const banks = await listSubBanks();
+  const all = [];
+  for (const bank of banks) {
+    const qs = await getSubBankQuestions(bank.id);
+    all.push(...qs);
+  }
+  return all;
 };

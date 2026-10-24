@@ -1,4 +1,4 @@
-import { loginWithGoogle, logoutAdmin, onAuth, getContent, getContentById, createContent, updateContent, deleteContent, getUsers, subscribeContent, saveQuestionBank, getQuestionBankMeta, getRandomQuestions, getAllBankQuestions } from './firebase.js';
+import { loginWithGoogle, logoutAdmin, onAuth, getContent, getContentById, createContent, updateContent, deleteContent, getUsers, subscribeContent, saveQuestionBank, getQuestionBankMeta, getRandomQuestions, getAllBankQuestions, saveSubBank, deleteSubBank, listSubBanks, getSubBankQuestions, getAllSubBankQuestions } from './firebase.js';
 import { getFirestore, collection, getDocs } from 'firebase/firestore';
 import { getApp } from 'firebase/app';
 const db = getFirestore(getApp());
@@ -149,10 +149,10 @@ const Tgl=({value,onChange,label,desc})=>(
 
 const Card=({children,style={}})=><div style={{background:G.white,border:`1px solid ${G.border}`,borderRadius:12,padding:20,...style}}>{children}</div>;
 
-const Mdl=({open,onClose,title,children,width=760,disableBackdropClose=false})=>{
+const Mdl=({open,onClose,title,children,width=760,disableBackdropClose=false,zIndex=1000})=>{
   if(!open)return null;
   return(
-    <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,.4)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:1000,padding:16}}
+    <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,.4)",display:"flex",alignItems:"center",justifyContent:"center",zIndex,padding:16}}
       onClick={disableBackdropClose ? undefined : onClose}>
       <div onClick={e=>e.stopPropagation()} className="fu" style={{background:G.white,borderRadius:16,width:"100%",maxWidth:width,maxHeight:"92vh",overflow:"hidden",display:"flex",flexDirection:"column",boxShadow:"0 32px 80px rgba(0,0,0,.2)"}}>
         <div style={{padding:"18px 24px",borderBottom:`1px solid ${G.border}`,display:"flex",justifyContent:"space-between",alignItems:"center",flexShrink:0}}>
@@ -457,8 +457,8 @@ const BankBuilder = ({ parseCSV, uploading, progress, error, success, onUpload, 
   const removeStaged = (id) => setStaged(prev=>prev.filter(f=>f.id!==id));
 
   const handleUpload = (mode="replace") => {
-    const all = staged.flatMap(f=>f.questions);
-    onUpload(all, mode);
+    // Pass staged files individually so each can become a sub-bank
+    onUpload(staged, mode);
   };
 
   const TYPE_COLOR = {mcq:G.accent, sorting:G.purple, dragdrop:G.blue, sheets:"#16a34a"};
@@ -466,9 +466,10 @@ const BankBuilder = ({ parseCSV, uploading, progress, error, success, onUpload, 
 
   return (
     <div>
-      {/* Warning */}
-      <div style={{marginBottom:16,padding:12,background:G.amberLight,borderRadius:10,fontSize:12,color:G.amber,fontWeight:600}}>
-        ⚠️ Uploading replaces the entire question bank. Stage all your CSVs below before clicking Upload.
+      {/* Info box */}
+      <div style={{marginBottom:16,padding:12,background:G.blueLight,borderRadius:10,fontSize:12,color:G.blue,fontWeight:600,lineHeight:1.7}}>
+        💡 <strong>➕ Add to Bank</strong> — merges new questions with your existing bank (recommended!)<br/>
+        🔄 <strong>Replace Bank</strong> — deletes ALL existing questions and starts fresh (use with caution)
       </div>
 
       {/* Add CSV files */}
@@ -626,6 +627,229 @@ const BankBuilder = ({ parseCSV, uploading, progress, error, success, onUpload, 
   );
 };
 
+
+// ── PASSAGE IMPORTER ──────────────────────────────────────
+const PassageImporter = ({ onImport, onClose }) => {
+  const [text,   setText]   = useState("");
+  const [parsed, setParsed] = useState(null);
+  const [error,  setError]  = useState("");
+  const [step,   setStep]   = useState("paste");
+
+  const TEMPLATE = `TITLE: The Little Frog
+SUBJECT: Reading
+GRADE: 1
+ICON: 🐸
+XP: 100
+READING_TIME: 1 min
+WORD_COUNT: 55
+
+PASSAGE:
+Sam is a little green frog.
+Sam lives near a big blue pond.
+Every morning, Sam jumps on the lily pads.
+Sam eats flies and bugs for breakfast.
+Sam is a happy little frog!
+
+Q1: What colour is Sam the frog?
+A: Blue
+B: Red
+C: Green
+D: Yellow
+CORRECT: C
+EXPLANATION: The story says Sam is a little green frog.
+
+Q2: Where does Sam live?
+A: In a tree
+B: Near a big blue pond
+C: Under a rock
+D: In a house
+CORRECT: B
+EXPLANATION: Sam lives near a big blue pond.`;
+
+  const parse = () => {
+    setError("");
+    try {
+      const lines = text.trim().split("\n").map(l=>l.trim());
+      const getVal = (key) => {
+        const line = lines.find(l=>l.startsWith(key+":"));
+        return line ? line.slice(key.length+1).trim() : "";
+      };
+
+      const title     = getVal("TITLE")    || "Untitled";
+      const subject   = getVal("SUBJECT")  || "Reading";
+      const grade     = parseInt(getVal("GRADE"))||1;
+      const icon      = getVal("ICON")     || "📖";
+      const xp        = parseInt(getVal("XP"))||100;
+      const readTime  = getVal("READING_TIME") || "1 min";
+      const wordCount = parseInt(getVal("WORD_COUNT"))||0;
+
+      // Find PASSAGE: line and first Q line
+      const passStart = lines.findIndex(l=>l==="PASSAGE:");
+      const firstQIdx = lines.findIndex(l=>/^Q[0-9]+:/.test(l));
+      if(passStart===-1) throw new Error("Cannot find PASSAGE: section. Add a line that says exactly: PASSAGE:");
+
+      const endOfPass = firstQIdx===-1 ? lines.length : firstQIdx;
+      const passLines = lines.slice(passStart+1, endOfPass).filter(l=>l.length>0);
+      const passageText = passLines.join("\n\n");
+      if(!passageText.trim()) throw new Error("Passage text is empty.");
+
+      // Parse questions
+      const questions = [];
+      let i = firstQIdx === -1 ? lines.length : firstQIdx;
+      while(i < lines.length){
+        const qm = lines[i].match(/^Q[0-9]+:\s*(.+)/);
+        if(!qm){i++;continue;}
+        const qText = qm[1];
+        const opts = {};
+        let correct="", expl="";
+        let j = i+1;
+        while(j < lines.length && !/^Q[0-9]+:/.test(lines[j])){
+          const am = lines[j].match(/^([A-D]):\s*(.+)/);
+          if(am) opts[am[1]] = am[2];
+          if(lines[j].startsWith("CORRECT:"))     correct = lines[j].slice(8).trim();
+          if(lines[j].startsWith("EXPLANATION:")) expl    = lines[j].slice(12).trim();
+          j++;
+        }
+        if(qText && Object.keys(opts).length>=2 && correct){
+          const optsList = ["A","B","C","D"].map(k=>opts[k]).filter(Boolean);
+          const correctText = opts[correct]||correct;
+          questions.push({
+            id:`q${i}_${Math.random().toString(36).slice(2,6)}`,
+            type:"multiple_choice",
+            question:qText,
+            options:optsList,
+            correctAnswer:correctText,
+            explanation:expl,
+          });
+        }
+        i = j;
+      }
+
+      if(questions.length===0) throw new Error("No questions found. Make sure questions start with Q1:, Q2: etc.");
+      setParsed({title,subject,grade,icon,xp,readTime,wordCount,passageText,questions});
+      setStep("preview");
+    } catch(e){ setError("Error: "+e.message); }
+  };
+
+  const doImport = async (publish) => {
+    if(!parsed) return;
+    const content = {
+      id:`reading-${Date.now()}`,
+      type:"reading",
+      title:parsed.title,
+      subject:parsed.subject,
+      grade:parsed.grade,
+      icon:parsed.icon,
+      xpReward:parsed.xp,
+      published:publish,
+      hasPassage:true,
+      passage:{
+        title:parsed.title,
+        emoji:parsed.icon,
+        text:parsed.passageText,
+        readingTime:parsed.readTime,
+        wordCount:parsed.wordCount,
+      },
+      questions:parsed.questions,
+      items:parsed.questions.length,
+    };
+    await onImport(content);
+  };
+
+  return (
+    <div style={{display:"flex",flexDirection:"column",flex:1,minHeight:0}}>
+
+      {step==="paste"&&(
+        <div style={{flex:1,overflowY:"auto",padding:20}}>
+          <div style={{marginBottom:12,padding:12,background:G.blueLight,borderRadius:10,fontSize:12,color:G.blue,lineHeight:1.8}}>
+            <strong>How to use:</strong> Format your passage using the template. Each question uses Q1: Q2: etc. Options are A: B: C: D:. Mark the answer with CORRECT: A (just the letter).
+          </div>
+          <button onClick={()=>setText(TEMPLATE)}
+            style={{marginBottom:10,padding:"6px 14px",borderRadius:8,border:`1px solid ${G.border}`,
+              background:G.lighter,fontSize:12,cursor:"pointer",color:G.muted,fontFamily:"inherit"}}>
+            📋 Load Template
+          </button>
+          <textarea value={text} onChange={e=>setText(e.target.value)}
+            placeholder="Paste your passage and questions here using the template format..."
+            style={{width:"100%",height:380,border:`1px solid ${G.border}`,borderRadius:10,
+              padding:12,fontSize:12,fontFamily:"monospace",lineHeight:1.7,
+              outline:"none",resize:"vertical",boxSizing:"border-box"}}/>
+          {error&&<div style={{marginTop:8,padding:"8px 12px",background:G.dangerLight,
+            borderRadius:8,fontSize:12,color:G.danger}}>{error}</div>}
+        </div>
+      )}
+
+      {step==="preview"&&parsed&&(
+        <div style={{flex:1,overflowY:"auto",padding:20}}>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8,marginBottom:16}}>
+            {[["Title",parsed.title],["Grade",`Grade ${parsed.grade}`],["Subject",parsed.subject],
+              ["Questions",`${parsed.questions.length}q`],["XP",`${parsed.xp} XP`],["Read",parsed.readTime]
+            ].map(([k,v])=>(
+              <div key={k} style={{background:G.lighter,borderRadius:8,padding:"8px 10px"}}>
+                <div style={{fontSize:10,fontWeight:700,color:G.muted,textTransform:"uppercase"}}>{k}</div>
+                <div style={{fontSize:13,fontWeight:600,color:G.text,marginTop:2}}>{v}</div>
+              </div>
+            ))}
+          </div>
+
+          <div style={{background:G.lighter,borderRadius:10,padding:14,marginBottom:16}}>
+            <div style={{fontWeight:700,fontSize:13,marginBottom:10}}>📖 Passage</div>
+            {parsed.passageText.split("\n").filter(Boolean).map((l,i)=>(
+              <p key={i} style={{fontSize:13,lineHeight:1.7,marginBottom:6,color:G.text}}>{l}</p>
+            ))}
+          </div>
+
+          <div style={{fontWeight:700,fontSize:13,marginBottom:10}}>
+            ❓ {parsed.questions.length} Questions
+          </div>
+          {parsed.questions.map((q,i)=>(
+            <div key={i} style={{background:G.white,border:`1px solid ${G.border}`,
+              borderRadius:10,padding:12,marginBottom:8}}>
+              <div style={{fontWeight:600,fontSize:13,marginBottom:8,color:G.text}}>
+                Q{i+1}. {q.question}
+              </div>
+              <div style={{display:"flex",flexWrap:"wrap",gap:6}}>
+                {q.options.map((opt,j)=>(
+                  <span key={j} style={{fontSize:11,padding:"3px 8px",borderRadius:6,
+                    background:opt===q.correctAnswer?G.greenLight:G.light,
+                    color:opt===q.correctAnswer?G.green:G.muted,
+                    border:`1px solid ${opt===q.correctAnswer?"#86efac":G.border}`,
+                    fontWeight:opt===q.correctAnswer?700:400}}>
+                    {"ABCD"[j]}. {opt}{opt===q.correctAnswer?" ✓":""}
+                  </span>
+                ))}
+              </div>
+              {q.explanation&&<div style={{marginTop:6,fontSize:11,color:G.muted}}>💡 {q.explanation}</div>}
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div style={{padding:"14px 20px",borderTop:`1px solid ${G.border}`,
+        display:"flex",justifyContent:"space-between",alignItems:"center",flexShrink:0,background:G.white}}>
+        {step==="paste"?(
+          <>
+            <Btn variant="ghost" onClick={onClose}>Cancel</Btn>
+            <Btn onClick={parse} disabled={!text.trim()} style={{background:G.accent,borderColor:G.accent,color:"#fff"}}>
+              Parse → Preview
+            </Btn>
+          </>
+        ):(
+          <>
+            <Btn variant="secondary" onClick={()=>{setStep("paste");setError("");}}>← Edit</Btn>
+            <div style={{display:"flex",gap:8}}>
+              <Btn variant="secondary" onClick={()=>doImport(false)}>Save as Draft</Btn>
+              <Btn onClick={()=>doImport(true)} style={{background:G.accent,borderColor:G.accent,color:"#fff"}}>
+                ✓ Publish
+              </Btn>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+};
+
 // ── QUESTION BANK MANAGER ─────────────────────────────────
 const QuestionBankManager = ({ onClose }) => {
   const [tab,       setTab]       = useState("browse"); // browse | upload | pick
@@ -679,8 +903,24 @@ const QuestionBankManager = ({ onClose }) => {
       if(!correct && type!=="sorting" && type!=="drag_drop") return;
       const opts=["optiona","optionb","optionc","optiond"].map(k=>get(k)).filter(Boolean);
       let qOptions = type==="true_false"?["True","False"]:opts;
-      let qCorrect = opts.includes(correct)?correct:(opts.find(o=>o.toLowerCase()===correct.toLowerCase())||correct);
-      let qCat1="",qCat2="",qItems1="",qItems2="";
+      // Handle letter-based correct (A/B/C/D) or text-based correct
+      const letterMap = {a:0,b:1,c:2,d:3};
+      const corrLower = (correct||'').toLowerCase();
+      let qCorrect;
+      if(type==="true_false"){
+        qCorrect = correct.charAt(0).toUpperCase()+correct.slice(1).toLowerCase();
+        if(!["True","False"].includes(qCorrect)) return;
+      } else if(letterMap[corrLower]!==undefined && opts[letterMap[corrLower]]){
+        // Letter format: A→optionA, B→optionB etc
+        qCorrect = opts[letterMap[corrLower]];
+      } else {
+        qCorrect = opts.includes(correct)?correct:(opts.find(o=>o.toLowerCase()===corrLower)||correct);
+      }
+      // Sorting & drag-drop fields
+      const qCat1   = get("cat1")||get("category1")||"";
+      const qCat2   = get("cat2")||get("category2")||"";
+      const qItems1 = get("items1")||get("category1items")||"";
+      const qItems2 = get("items2")||get("category2items")||"";
 
       if(type==="fill_blank"){
         // Fill blank: 2 hint options only
@@ -701,32 +941,20 @@ const QuestionBankManager = ({ onClose }) => {
     return questions;
   };
 
-  const uploadQuestions = async (questions, mode="replace") => {
+  const uploadQuestions = async (stagedFiles, mode="replace") => {
     setUploading(true);
     setError(""); setSuccess("");
     try {
-      let finalQuestions = questions;
-
-      if (mode === "add") {
-        // Load ALL existing bank questions and append
-        setProgress("Loading existing bank...");
-        try {
-          const existing = await getAllBankQuestions();
-          finalQuestions = [...existing, ...questions];
-          setProgress(`Merging ${existing.length} existing + ${questions.length} new questions...`);
-        } catch(e) {
-          console.warn("Could not load existing bank:", e);
-          finalQuestions = questions;
-        }
+      for (let i = 0; i < stagedFiles.length; i++) {
+        const file = stagedFiles[i];
+        const bankId   = `bank_${file.name.replace(/[^a-z0-9]/gi,'_').toLowerCase()}_${Date.now()}`;
+        const bankName = file.name.replace(/\.[^.]+$/,'');
+        setProgress(`Saving "${bankName}" (${i+1}/${stagedFiles.length})...`);
+        await saveSubBank(bankId, bankName, file.questions);
       }
-
-      setProgress(`Saving ${finalQuestions.length} questions...`);
-      await saveQuestionBank(finalQuestions);
+      const total = stagedFiles.reduce((s,f)=>s+f.count,0);
       setProgress("");
-      const msg = mode==="add"
-        ? `✅ Added ${questions.length} questions! Bank now has ${finalQuestions.length} total.`
-        : `✅ ${finalQuestions.length} questions saved to bank!`;
-      setSuccess(msg);
+      setSuccess(`✅ ${stagedFiles.length} sub-bank${stagedFiles.length!==1?'s':''} saved with ${total} questions!`);
       await loadMeta();
       setTab("browse");
     } catch(e) {
@@ -947,7 +1175,8 @@ const QuestionBankManager = ({ onClose }) => {
               <div style={{textAlign:"center",padding:40,color:G.muted}}>Loading bank status...</div>
             ):meta?(
               <div>
-                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:20}}>
+                {/* Stats */}
+                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:16}}>
                   <div style={{background:G.accentLight,borderRadius:14,padding:20,textAlign:"center"}}>
                     <div style={{fontSize:40,fontWeight:900,color:G.accent}}>{meta.totalQuestions?.toLocaleString()}</div>
                     <div style={{fontSize:13,color:G.muted,fontWeight:600}}>Total Questions</div>
@@ -957,11 +1186,7 @@ const QuestionBankManager = ({ onClose }) => {
                     <div style={{fontSize:13,color:G.muted,fontWeight:600}}>Storage Chunks</div>
                   </div>
                 </div>
-                <div style={{background:G.lighter,borderRadius:12,padding:16,marginBottom:16}}>
-                  <div style={{fontSize:13,fontWeight:600,color:G.text,marginBottom:8}}>Last updated</div>
-                  <div style={{fontSize:12,color:G.muted}}>{meta.updatedAt?.toDate?.()?.toLocaleString()||"Unknown"}</div>
-                </div>
-                <div style={{display:"flex",gap:10}}>
+                <div style={{display:"flex",gap:10,marginBottom:16}}>
                   <button onClick={()=>setTab("upload")}
                     style={{flex:1,padding:"10px",borderRadius:10,border:`1.5px solid ${G.accent}`,background:G.accentLight,color:G.accent,fontWeight:700,fontSize:13,cursor:"pointer"}}>
                     ⬆️ Upload More
@@ -971,12 +1196,20 @@ const QuestionBankManager = ({ onClose }) => {
                     🎲 Pick Questions
                   </button>
                 </div>
+                {/* Sub-bank list */}
+                <SubBankManager onPickFromBank={async(bank)=>{
+                  setPickLoading(true);
+                  const qs = await getSubBankQuestions(bank.id);
+                  setPicked(qs.slice(0,filters.count||10));
+                  setPickLoading(false);
+                  setTab('pick');
+                }}/>
               </div>
             ):(
               <div style={{textAlign:"center",padding:40}}>
                 <div style={{fontSize:52,marginBottom:12}}>📭</div>
                 <div style={{fontWeight:700,fontSize:16,color:G.text,marginBottom:8}}>No question bank yet</div>
-                <div style={{fontSize:13,color:G.muted,marginBottom:20}}>Upload a CSV or Google Sheet with up to 1000+ questions</div>
+                <div style={{fontSize:13,color:G.muted,marginBottom:20}}>Upload a CSV to get started</div>
                 <button onClick={()=>setTab("upload")}
                   style={{padding:"10px 24px",borderRadius:10,border:"none",background:G.accent,color:"#fff",fontWeight:700,fontSize:13,cursor:"pointer"}}>
                   ⬆️ Upload Question Bank
@@ -1987,9 +2220,12 @@ const Builder=({contentType,initial,onSave,onCancel})=>{
       passage: c.passage||{title:"",emoji:"📖",text:"",readingTime:"2 min",wordCount:0},
     };
     try{
-      if(initial&&initial.id){
-        await updateContent(initial.id, data);
+      if(initial && initial.id){
+        // Update existing — use initial.id as the Firestore document key
+        console.log('Updating doc:', initial.id);
+        await updateContent(initial.id, {...data, id: initial.id});
       } else {
+        console.log('Creating new doc:', data.id);
         await createContent(data);
       }
       onSave(data);
@@ -2332,11 +2568,12 @@ const Builder=({contentType,initial,onSave,onCancel})=>{
 };
 
 // ── CONTENT LIST ───────────────────────────────────────────
-const ContentList=({onNew,onEdit})=>{  // no refreshKey needed - uses real-time listener
+const ContentList=({onNew,onEdit,onImportPassage})=>{  // no refreshKey needed - uses real-time listener
   const [items,setItems]=useState([]);
   const [loading,setLoading]=useState(true);
   const [search,setSearch]=useState("");
   const [fType,setFType]=useState("all");
+  const [selected,setSelected]=useState(new Set()); // for bulk delete
   const [fSub,setFSub]=useState("All");
   const [fGrade,setFGrade]=useState("All");
   const [delTarget,setDelTarget]=useState(null);
@@ -2351,9 +2588,9 @@ const ContentList=({onNew,onEdit})=>{  // no refreshKey needed - uses real-time 
   },[]);
 
   const filtered=items.filter(w=>{
-    const ms=w.title.toLowerCase().includes(search.toLowerCase());
+    const ms=(w.title||'').toLowerCase().includes(search.toLowerCase());
     const mt=fType==="all"||w.type===fType;
-    const msub=fSub==="All"||w.subject===fSub;
+    const msub=fSub==="All"||(w.subject||'')===(fSub);
     const mg=fGrade==="All"||w.grade===Number(fGrade);
     return ms&&mt&&msub&&mg;
   });
@@ -2369,7 +2606,25 @@ const ContentList=({onNew,onEdit})=>{  // no refreshKey needed - uses real-time 
         </div>
         <div style={{display:"flex",gap:8,alignItems:"center"}}>
           <button onClick={()=>window.location.reload()} style={{background:G.light,border:`1px solid ${G.border}`,borderRadius:8,padding:"6px 12px",fontSize:12,cursor:"pointer",color:G.muted}}>↻ Refresh</button>
-          {Object.values(CONTENT_TYPES).map(ct=>(
+          {selected.size>0&&(
+            <button onClick={async()=>{
+              if(!window.confirm(`Delete ${selected.size} selected item(s)? This cannot be undone.`)) return;
+              const ids=[...selected];
+              setSelected(new Set());
+              for(const id of ids){
+                try{ await deleteContent(id); console.log('✅ Deleted:',id); }
+                catch(e){ console.error('❌ Failed:',id,e); }
+              }
+            }} style={{background:G.danger,border:"none",borderRadius:8,padding:"6px 12px",
+              fontSize:12,cursor:"pointer",color:"#fff",fontWeight:600}}>
+              🗑 Delete {selected.size} selected
+            </button>
+          )}
+          <Btn variant="secondary" size="sm" onClick={()=>onImportPassage&&onImportPassage()}
+              style={{borderColor:G.green+"40",color:G.green,background:G.greenLight}}>
+              📖 Import Passage
+            </Btn>
+            {Object.values(CONTENT_TYPES).map(ct=>(
             <Btn key={ct.id} variant="secondary" size="sm" onClick={()=>onNew(ct.id)}
               style={{borderColor:ct.color+"40",color:ct.color,background:ct.colorLight}}>
               {ct.icon} New {ct.label}
@@ -2403,6 +2658,12 @@ const ContentList=({onNew,onEdit})=>{  // no refreshKey needed - uses real-time 
         <table style={{width:"100%",borderCollapse:"collapse"}}>
           <thead>
             <tr style={{borderBottom:`1px solid ${G.border}`,background:G.bg}}>
+              <th style={{padding:"10px 16px",width:32}}>
+                <input type="checkbox"
+                  checked={selected.size===filtered.length&&filtered.length>0}
+                  onChange={e=>setSelected(e.target.checked?new Set(filtered.map(i=>i.id)):new Set())}
+                />
+              </th>
               {["Content","Type","Subject","Grade","Items","XP","Status",""].map((h,i)=>(
                 <th key={i} style={{padding:"10px 16px",textAlign:"left",fontSize:11,fontWeight:600,color:G.muted,textTransform:"uppercase",letterSpacing:.5,whiteSpace:"nowrap"}}>{h}</th>
               ))}
@@ -2416,10 +2677,20 @@ const ContentList=({onNew,onEdit})=>{  // no refreshKey needed - uses real-time 
                   onMouseEnter={e=>e.currentTarget.style.background=G.bg}
                   onMouseLeave={e=>e.currentTarget.style.background="transparent"}>
                   <td style={{padding:"13px 16px"}}>
+                    <input type="checkbox"
+                      checked={selected.has(item.id)}
+                      onChange={e=>{
+                        const next=new Set(selected);
+                        e.target.checked?next.add(item.id):next.delete(item.id);
+                        setSelected(next);
+                      }}
+                    />
+                  </td>
+                  <td style={{padding:"13px 16px"}}>
                     <div style={{display:"flex",alignItems:"center",gap:10}}>
                       <span style={{fontSize:24}}>{item.icon}</span>
                       <div>
-                        <div style={{fontWeight:500,fontSize:13}}>{item.title}</div>
+                        <div style={{fontWeight:500,fontSize:13}}>{item.title||'Untitled'}</div>
                         <div style={{fontSize:11,color:G.muted,fontFamily:G.mono}}>{item.id}</div>
                       </div>
                     </div>
@@ -2433,8 +2704,11 @@ const ContentList=({onNew,onEdit})=>{  // no refreshKey needed - uses real-time 
                     <button onClick={async()=>{
                       const updated={...item,published:!item.published};
                       setItems(prev=>prev.map(w=>w.id===item.id?updated:w));
-                      // Fire and forget - don't reload after toggle
-                      updateContent(item.id,{published:!item.published}).catch(e=>console.warn("Toggle failed:",e));
+                      updateContent(item.id,{published:!item.published}).catch(e=>{
+                        console.error("Toggle failed for id:", item.id, e);
+                        // Revert local state if update failed
+                        setItems(prev=>prev.map(w=>w.id===item.id?item:w));
+                      });
                     }}
                       style={{padding:"4px 10px",borderRadius:6,border:"none",background:item.published?G.greenLight:G.light,color:item.published?G.green:G.muted,fontSize:11,fontWeight:600,cursor:"pointer"}}>
                       {item.published?"● Live":"○ Draft"}
@@ -2465,18 +2739,21 @@ const ContentList=({onNew,onEdit})=>{  // no refreshKey needed - uses real-time 
         )}
       </Card>
 
-      <Mdl open={!!delTarget} onClose={()=>setDelTarget(null)} title="Delete Content" width={420}>
+      <Mdl open={!!delTarget} onClose={()=>setDelTarget(null)} title="Delete Content" width={420} zIndex={3000}>
         <div style={{padding:24}}>
           <p style={{color:G.muted,fontSize:13,marginBottom:20}}>Delete <strong>"{delTarget?.title}"</strong>? This cannot be undone.</p>
           <div style={{display:"flex",gap:8,justifyContent:"flex-end"}}>
             <Btn variant="secondary" onClick={()=>setDelTarget(null)}>Cancel</Btn>
             <Btn variant="danger" onClick={async()=>{
               const id = delTarget.id;
-              // Remove from local state immediately - no reload
-              setItems(prev=>prev.filter(w=>w.id!==id));
               setDelTarget(null);
-              // Fire and forget - don't reload after
-              deleteContent(id).catch(e=>console.warn("Delete failed:",e));
+              try {
+                await deleteContent(id);
+                console.log('✅ Deleted:', id);
+              } catch(e) {
+                console.error("Delete failed:", e);
+                alert('Delete failed: ' + e.message + '\n\nID: ' + id);
+              }
             }}>Delete</Btn>
           </div>
         </div>
@@ -2487,6 +2764,136 @@ const ContentList=({onNew,onEdit})=>{  // no refreshKey needed - uses real-time 
 
 // ── DASHBOARD ──────────────────────────────────────────────
 // ── QUESTION BANK PAGE (full page) ────────────────────────
+// ── SUB BANK MANAGER ───────────────────────────────────────
+const SubBankManager = ({ onPickFromBank }) => {
+  const [banks,      setBanks]      = useState([]);
+  const [loading,    setLoading]    = useState(true);
+  const [expanded,   setExpanded]   = useState(null); // bankId
+  const [bankQs,     setBankQs]     = useState({});   // {bankId: questions[]}
+  const [loadingQs,  setLoadingQs]  = useState(null);
+  const [search,     setSearch]     = useState('');
+  const [deleting,   setDeleting]   = useState(null);
+
+  useEffect(() => { load(); }, []);
+
+  const load = async () => {
+    setLoading(true);
+    try { setBanks(await listSubBanks()); }
+    catch(e) { console.error(e); }
+    setLoading(false);
+  };
+
+  const expand = async (bankId) => {
+    if (expanded === bankId) { setExpanded(null); return; }
+    setExpanded(bankId);
+    if (!bankQs[bankId]) {
+      setLoadingQs(bankId);
+      const qs = await getSubBankQuestions(bankId);
+      setBankQs(prev => ({...prev, [bankId]: qs}));
+      setLoadingQs(null);
+    }
+  };
+
+  const handleDelete = async (bank) => {
+    if (!window.confirm(`Delete "${bank.name}"? This removes all ${bank.totalQuestions} questions.`)) return;
+    setDeleting(bank.id);
+    await deleteSubBank(bank.id);
+    setBanks(prev => prev.filter(b => b.id !== bank.id));
+    setDeleting(null);
+  };
+
+  const TYPE_COLOR = { multiple_choice:G.blue, true_false:G.green, fill_blank:G.accent, drag_drop:G.purple, sorting:G.amber };
+  const TYPE_LABEL = { multiple_choice:'MCQ', true_false:'T/F', fill_blank:'Fill', drag_drop:'Drag', sorting:'Sort' };
+
+  if (loading) return <div style={{textAlign:'center',padding:24,color:G.muted}}>Loading sub-banks...</div>;
+
+  if (banks.length === 0) return (
+    <div style={{textAlign:'center',padding:24,color:G.muted}}>
+      <div style={{fontSize:32,marginBottom:8}}>📭</div>
+      <div style={{fontWeight:600}}>No sub-banks yet</div>
+      <div style={{fontSize:12,marginTop:4}}>Upload CSVs in the Upload tab to create sub-banks</div>
+    </div>
+  );
+
+  return (
+    <div>
+      <input value={search} onChange={e=>setSearch(e.target.value)}
+        placeholder="🔍 Search banks..."
+        style={{width:'100%',marginBottom:12,padding:'8px 12px',borderRadius:8,
+          border:`1px solid ${G.border}`,fontSize:12,outline:'none',boxSizing:'border-box'}}/>
+
+      {banks.filter(b=>(b.name||'').toLowerCase().includes(search.toLowerCase())).map(bank => {
+        const qs     = bankQs[bank.id] || [];
+        const isOpen = expanded === bank.id;
+        const col    = TYPE_COLOR[bank.type] || G.accent;
+
+        return (
+          <div key={bank.id} style={{marginBottom:8,borderRadius:12,border:`1.5px solid ${isOpen?col:G.border}`,
+            overflow:'hidden',background:G.white}}>
+
+            {/* Bank header */}
+            <div style={{display:'flex',alignItems:'center',gap:10,padding:'12px 14px',
+              background:isOpen?col+'10':'transparent',cursor:'pointer'}}
+              onClick={()=>expand(bank.id)}>
+              <div style={{flex:1}}>
+                <div style={{fontWeight:700,fontSize:14,color:G.text}}>{bank.name}</div>
+                <div style={{fontSize:11,color:G.muted,marginTop:2}}>
+                  {bank.totalQuestions} questions
+                  {bank.grade && ` · Grade ${bank.grade}`}
+                  {bank.subject && ` · ${bank.subject}`}
+                  {bank.type && <span style={{marginLeft:6,background:col+'20',color:col,
+                    padding:'1px 6px',borderRadius:99,fontSize:10,fontWeight:700}}>
+                    {TYPE_LABEL[bank.type]||bank.type}
+                  </span>}
+                </div>
+              </div>
+              <div style={{display:'flex',gap:6,alignItems:'center'}}>
+                {onPickFromBank && (
+                  <button onClick={e=>{e.stopPropagation();onPickFromBank(bank);}}
+                    style={{padding:'5px 12px',borderRadius:8,border:`1.5px solid ${col}`,
+                      background:col,color:'#fff',fontSize:11,fontWeight:700,cursor:'pointer'}}>
+                    🎲 Pick
+                  </button>
+                )}
+                <button onClick={e=>{e.stopPropagation();handleDelete(bank);}}
+                  disabled={deleting===bank.id}
+                  style={{padding:'5px 10px',borderRadius:8,border:`1.5px solid ${G.danger}`,
+                    background:G.dangerLight,color:G.danger,fontSize:11,fontWeight:700,cursor:'pointer'}}>
+                  {deleting===bank.id?'...':'🗑'}
+                </button>
+                <span style={{fontSize:16,color:G.muted}}>{isOpen?'▲':'▼'}</span>
+              </div>
+            </div>
+
+            {/* Questions list */}
+            {isOpen && (
+              <div style={{borderTop:`1px solid ${G.border}`,maxHeight:320,overflowY:'auto'}}>
+                {loadingQs===bank.id ? (
+                  <div style={{padding:16,textAlign:'center',color:G.muted,fontSize:12}}>Loading questions...</div>
+                ) : qs.map((q,i) => (
+                  <div key={i} style={{padding:'10px 14px',borderBottom:i<qs.length-1?`1px solid ${G.border}`:'none',
+                    fontSize:12}}>
+                    <div style={{display:'flex',gap:6,marginBottom:4}}>
+                      <span style={{background:TYPE_COLOR[q.type]+'20',color:TYPE_COLOR[q.type]||G.muted,
+                        fontSize:10,fontWeight:700,padding:'1px 6px',borderRadius:99}}>
+                        {TYPE_LABEL[q.type]||q.type}
+                      </span>
+                    </div>
+                    <div style={{fontWeight:500,color:G.text,lineHeight:1.5}}>{q.question}</div>
+                    {q.correctAnswer && (
+                      <div style={{marginTop:3,fontSize:11,color:G.green}}>✓ {q.correctAnswer}</div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+};
+
 const QuestionBankPage = () => {
   const [meta,        setMeta]        = useState(null);
   const [loading,     setLoading]     = useState(true);
@@ -2565,8 +2972,15 @@ const QuestionBankPage = () => {
         if(qOptions.length < 2) return;
         // Ensure correct matches an option
         if(!qOptions.includes(correct)){
-          const m = qOptions.find(o=>o.toLowerCase()===correct.toLowerCase());
+          // Handle letter-based (A/B/C/D) or text-based correct
+        const letterMap = {a:0,b:1,c:2,d:3};
+        const corrLow = (correct||'').toLowerCase();
+        if(letterMap[corrLow]!==undefined && qOptions[letterMap[corrLow]]){
+          qCorrect = qOptions[letterMap[corrLow]];
+        } else {
+          const m = qOptions.find(o=>o.toLowerCase()===corrLow);
           if(m) qCorrect = m; else return;
+        }
         }
       } else if(type==="true_false"){
         qOptions = ["True","False"];
@@ -2584,32 +2998,31 @@ const QuestionBankPage = () => {
         type, question, correctAnswer:qCorrect,
         explanation:expl, grade, subject, xpReward:xp,
         options:qOptions, icon:"📝",
+        cat1:   get("cat1")||get("category1")||"",
+        cat2:   get("cat2")||get("category2")||"",
+        items1: get("items1")||get("category1items")||"",
+        items2: get("items2")||get("category2items")||"",
+        emoji1: get("emoji1")||"",
+        emoji2: get("emoji2")||"",
       });
     });
     return questions;
   };
 
-  const uploadQuestions = async (questions, mode="replace") => {
+  const uploadQuestions = async (stagedFiles, mode="replace") => {
     setUploading(true); setError(""); setSuccess("");
     try {
-      let final = questions;
-      if(mode==="add"){
-        setProgress("Loading existing bank...");
-        try {
-          const existing = await getAllBankQuestions();
-          final = [...existing, ...questions];
-          setProgress(`Merging ${existing.length} existing + ${questions.length} new...`);
-        } catch(e) {
-          console.warn("Could not load existing:", e);
-          final = questions;
-        }
+      // Each staged file becomes its own sub-bank
+      for (let i = 0; i < stagedFiles.length; i++) {
+        const file = stagedFiles[i];
+        const bankId   = `bank_${file.name.replace(/[^a-z0-9]/gi,'_').toLowerCase()}_${Date.now()}`;
+        const bankName = file.name.replace(/\.[^.]+$/,''); // strip extension
+        setProgress(`Saving sub-bank ${i+1}/${stagedFiles.length}: "${bankName}"...`);
+        await saveSubBank(bankId, bankName, file.questions);
       }
-      setProgress(`Saving ${final.length} questions...`);
-      await saveQuestionBank(final);
+      const total = stagedFiles.reduce((s,f)=>s+f.count,0);
       setProgress("");
-      setSuccess(mode==="add"
-        ? `✅ Added ${questions.length} questions! Bank now has ${final.length} total.`
-        : `✅ ${final.length} questions saved to bank!`);
+      setSuccess(`✅ ${stagedFiles.length} sub-bank${stagedFiles.length!==1?'s':''} created with ${total} questions total!`);
       await loadMeta();
       setActiveTab("status");
     } catch(e){ setError("Upload failed: "+e.message); }
@@ -2670,17 +3083,28 @@ const QuestionBankPage = () => {
                   ⬆️ Upload More Questions
                 </button>
               </div>
+              {/* Sub-bank list */}
+              <div style={{marginTop:20}}>
+                <div style={{fontWeight:700,fontSize:15,color:G.text,marginBottom:12}}>📚 Your Sub-Banks</div>
+                <SubBankManager onPickFromBank={async(bank)=>{
+                  setActiveTab("upload");
+                }}/>
+              </div>
             </div>
           ):(
-            <div style={{textAlign:"center",padding:60}}>
+            <><div style={{textAlign:"center",padding:60}}>
               <div style={{fontSize:52,marginBottom:12}}>📭</div>
-              <div style={{fontWeight:700,fontSize:16,color:G.text,marginBottom:8}}>No question bank yet</div>
-              <div style={{fontSize:13,color:G.muted,marginBottom:20}}>Upload CSV files or Google Sheets to build your question bank.</div>
+              <div style={{fontWeight:700,fontSize:16,color:G.text,marginBottom:8}}>No legacy question bank</div>
+              <div style={{fontSize:13,color:G.muted,marginBottom:20}}>Upload CSV files to build your question bank.</div>
               <button onClick={()=>setActiveTab("upload")}
                 style={{padding:"10px 24px",borderRadius:10,border:"none",background:G.accent,color:"#fff",fontWeight:700,fontSize:13,cursor:"pointer"}}>
                 ⬆️ Upload Question Bank
               </button>
             </div>
+            <div style={{marginTop:20}}>
+              <div style={{fontWeight:700,fontSize:15,color:G.text,marginBottom:12}}>📚 Your Sub-Banks</div>
+              <SubBankManager onPickFromBank={()=>setActiveTab("upload")}/>
+            </div></>
           )}
           {success&&<div style={{marginTop:16,padding:"10px 14px",background:G.greenLight,borderRadius:10,fontSize:13,color:G.green,fontWeight:600}}>{success}</div>}
         </div>
@@ -2712,18 +3136,13 @@ const Dashboard=({onNavigate})=>{
     {label:"Worksheets Done",value:"...",sub:"all time",   icon:"📊",color:G.green},
   ]);
   const [typeStats,setTypeStats]=useState(Object.values(CONTENT_TYPES).map(ct=>({...ct,count:0,pub:0})));
-  const [recentContent,setRecentContent]=useState(MOCK_CONTENT.slice(0,5));
+  const [recentContent,setRecentContent]=useState([]);
   const [topUsers,setTopUsers]=useState(MOCK_USERS.slice(0,5));
   const [loading,setLoading]=useState(true);
 
   useEffect(()=>{
-    loadDashboard();
-  },[]);
-
-  const loadDashboard = async () => {
-    try {
-      // Load content
-      const content = await getContent();
+    // Live listener for content — updates instantly on any change
+    const unsub = subscribeContent((content)=>{
       const typeCounts = Object.values(CONTENT_TYPES).map(ct=>({
         ...ct,
         count: content.filter(c=>c.type===ct.id).length,
@@ -2731,7 +3150,14 @@ const Dashboard=({onNavigate})=>{
       }));
       setTypeStats(typeCounts);
       setRecentContent(content.slice(0,5));
+      setLoading(false);
+    });
+    loadDashboard();
+    return ()=>{ if(unsub) unsub(); };
+  },[]);
 
+  const loadDashboard = async () => {
+    try {
       // Load users
       const users = await getUsers();
       const totalXP = users.reduce((sum,u)=>sum+(u.xp||0),0);
@@ -2890,6 +3316,7 @@ export default function FoxlingAdmin(){
   const [editItem,setEditItem]=useState(null);
   const [toast,setToast]=useState(null);
   const [refreshKey,setRefreshKey]=useState(0);
+  const [importerOpen,setImporterOpen]=useState(false);
   const [loggedIn,    setLoggedIn]    = useState(false);
   const [authLoading, setAuthLoading] = useState(true);
   const [loginErr,    setLoginErr]    = useState("");
@@ -2983,6 +3410,10 @@ export default function FoxlingAdmin(){
           ))}
           <div style={{marginTop:20,padding:"0 4px"}}>
             <div style={{fontSize:10,fontWeight:600,color:G.muted,textTransform:"uppercase",letterSpacing:.5,marginBottom:8,padding:"0 6px"}}>Quick Create</div>
+            <Btn variant="secondary" size="sm" onClick={()=>setImporterOpen(true)}
+              style={{borderColor:G.green+"40",color:G.green,background:G.greenLight}}>
+              📖 Import Passage
+            </Btn>
             {Object.values(CONTENT_TYPES).map(ct=>(
               <button key={ct.id} onClick={()=>{setBuilderType(ct.id);setEditItem(null);setBuilderOpen(true);setPage("content");}}
                 style={{width:"100%",display:"flex",alignItems:"center",gap:8,padding:"7px 10px",borderRadius:8,border:"none",background:"transparent",color:G.muted,fontSize:12,cursor:"pointer",marginBottom:2,textAlign:"left"}}
@@ -3001,13 +3432,16 @@ export default function FoxlingAdmin(){
       <div style={{flex:1,overflow:"auto"}}>
         <div style={{padding:28,maxWidth:1100,margin:"0 auto"}}>
           {page==="dashboard"   &&<Dashboard onNavigate={setPage}/>}
-          {page==="content"     &&<ContentList onNew={type=>{setBuilderType(type);setEditItem(null);setBuilderOpen(true);}} onEdit={async(item)=>{
+          {page==="content"     &&<ContentList onNew={type=>{setBuilderType(type);setEditItem(null);setBuilderOpen(true);}} onImportPassage={()=>setImporterOpen(true)} onEdit={async(item)=>{
               setBuilderType(item.type);
-              setEditItem(item);
+              setEditItem(item);  // set immediately with what we have
               setBuilderOpen(true);
               try {
                 const full = await getContentById(item.id);
-                if(full) setEditItem(full);
+                // Only update if we got a valid result with the same id
+                if(full && full.id === item.id) {
+                  setEditItem({...full, id: item.id}); // always preserve Firestore doc ID
+                }
               } catch(e){ console.warn("Could not fetch full item",e); }
             }}/>}
           {page==="questionbank"&&<QuestionBankPage/>}
@@ -3020,6 +3454,31 @@ export default function FoxlingAdmin(){
           onSave={item=>{setBuilderOpen(false);setRefreshKey(k=>k+1);setToast({message:item.published?"Published successfully!":"Saved as draft",type:"success"});}}
           onCancel={()=>setBuilderOpen(false)}/>
       </Mdl>
+
+      {/* Passage Importer Modal */}
+      {importerOpen&&(
+        <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.4)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:2000,padding:16}}>
+          <div style={{background:G.white,borderRadius:16,width:"100%",maxWidth:700,height:"88vh",display:"flex",flexDirection:"column",overflow:"hidden",boxShadow:"0 32px 80px rgba(0,0,0,.2)"}}>
+            <div style={{padding:"18px 24px",borderBottom:`1px solid ${G.border}`,display:"flex",justifyContent:"space-between",alignItems:"center",flexShrink:0}}>
+              <div>
+                <span style={{fontWeight:700,fontSize:16}}>📖 Import Reading Passage</span>
+                <span style={{fontSize:12,color:G.muted,marginLeft:8}}>Paste passage + questions — creates content instantly</span>
+              </div>
+              <button onClick={()=>setImporterOpen(false)} style={{background:G.light,border:"none",borderRadius:6,width:28,height:28,cursor:"pointer",fontSize:14,color:G.muted}}>✕</button>
+            </div>
+            <PassageImporter
+              onImport={async(content)=>{
+                try{
+                  await createContent({...content,published:content._publish||false});
+                  setImporterOpen(false);
+                  setToast({message:"Passage imported successfully!",type:"success"});
+                }catch(e){console.error(e);}
+              }}
+              onClose={()=>setImporterOpen(false)}
+            />
+          </div>
+        </div>
+      )}
 
       {toast&&<Tst message={toast.message} type={toast.type} onClose={()=>setToast(null)}/>}
     </div>
